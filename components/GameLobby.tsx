@@ -2,14 +2,15 @@
 
 import { useState, useEffect } from 'react'
 import { User } from '@supabase/supabase-js'
-import { supabase } from '@/lib/supabase'
+import { supabase } from '../lib/supabase'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import GameRoom from '@/components/GameRoom'
+import GameRoom from './GameRoom'
 import { Plus, Users, LogOut } from 'lucide-react'
+import { useToast } from '@/hooks/use-toast'
 
-interface GameRoom {
+interface GameRoomType {
   id: string
   name: string
   host_id: string
@@ -18,16 +19,17 @@ interface GameRoom {
 }
 
 export default function GameLobby({ user }: { user: User }) {
-  const [rooms, setRooms] = useState<GameRoom[]>([])
+  const [rooms, setRooms] = useState<GameRoomType[]>([])
   const [newRoomName, setNewRoomName] = useState('')
   const [activeRoom, setActiveRoom] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const { toast } = useToast()
 
   useEffect(() => {
     fetchRooms()
     
     const roomSubscription = supabase
-      .channel('game-rooms')
+      .channel('public:game_rooms')
       .on('postgres_changes', 
         { event: '*', schema: 'public', table: 'game_rooms' }, 
         () => fetchRooms()
@@ -35,22 +37,34 @@ export default function GameLobby({ user }: { user: User }) {
       .subscribe()
 
     return () => {
-      roomSubscription.unsubscribe()
+      supabase.removeChannel(roomSubscription)
     }
   }, [])
 
   const fetchRooms = async () => {
+    // Fetch rooms and count players using a left join.
+    // The query now correctly includes rooms with zero players.
     const { data, error } = await supabase
       .from('game_rooms')
       .select(`
         *,
-        game_players!inner (
+        game_players (
           id
         )
       `)
       .eq('is_active', true)
 
-    if (!error && data) {
+    if (error) {
+        console.error("Error fetching rooms:", error)
+        toast({
+            title: "Error",
+            description: "Could not fetch game rooms.",
+            variant: "destructive"
+        })
+        return
+    }
+    
+    if (data) {
       const roomsWithCount = data.map(room => ({
         ...room,
         player_count: Array.isArray(room.game_players) ? room.game_players.length : 0
@@ -65,106 +79,67 @@ export default function GameLobby({ user }: { user: User }) {
     setLoading(true)
     
     try {
-      // First ensure user profile exists
-      const { data: userData, error: userError } = await supabase.auth.getUser()
-      if (userError || !userData.user) {
-        console.error('User not authenticated:', userError)
-        alert('Please sign in again.')
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) {
+        toast({ title: "Authentication Error", description: "You must be logged in to create a room.", variant: "destructive" })
         setLoading(false)
         return
-      }
-
-      // Check if user profile exists in users table, create if not
-      const { data: existingUser } = await supabase
-        .from('users')
-        .select('id')
-        .eq('id', userData.user.id)
-        .single()
-
-      if (!existingUser) {
-        const { error: profileError } = await supabase
-          .from('users')
-          .insert([
-            {
-              id: userData.user.id,
-              email: userData.user.email || '',
-              username: userData.user.user_metadata?.username || userData.user.email?.split('@')[0] || 'Player'
-            }
-          ])
-
-        if (profileError) {
-          console.error('Error creating user profile:', profileError)
-        }
       }
 
       const { data, error } = await supabase
         .from('game_rooms')
-        .insert([
-          {
-            name: newRoomName,
-            host_id: userData.user.id,
-          }
-        ])
+        .insert([{ name: newRoomName, host_id: user.id }])
         .select()
+        .single()
 
       if (error) {
-        console.error('Error creating room:', error.message, error.details, error.hint)
-        alert(`Failed to create room: ${error.message}`)
+        console.error('Error creating room:', error)
+        toast({ title: 'Error', description: `Failed to create room: ${error.message}`, variant: 'destructive' })
         setLoading(false)
         return
       }
 
-      if (data?.[0]) {
-        // Join the room as a player  
+      if (data) {
         const { error: joinError } = await supabase
           .from('game_players')
-          .insert([
-            {
-              room_id: data[0].id,
-              user_id: userData.user.id,
-            }
-          ])
+          .insert([{ room_id: data.id, user_id: user.id }])
 
         if (joinError) {
-          console.error('Error joining room:', joinError.message, joinError.details)
-          alert(`Created room but failed to join: ${joinError.message}`)
+          console.error('Error joining room:', joinError)
+          toast({ title: 'Error', description: `Created room but failed to join: ${joinError.message}`, variant: 'destructive' })
+        } else {
+          toast({ title: 'Success!', description: `Room "${newRoomName}" created and joined.` })
+          setActiveRoom(data.id)
+          setNewRoomName('')
         }
-
-        setActiveRoom(data[0].id)
-        setNewRoomName('')
       }
     } catch (err) {
       console.error('Unexpected error:', err)
-      alert('An unexpected error occurred. Please try again.')
+      toast({ title: 'Error', description: 'An unexpected error occurred. Please try again.', variant: 'destructive' })
+    } finally {
+      setLoading(false)
     }
-    
-    setLoading(false)
   }
 
   const joinRoom = async (roomId: string) => {
     try {
-      const { data: userData, error: userError } = await supabase.auth.getUser()
-      if (userError || !userData.user) {
-        alert('Please sign in again.')
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) {
+        toast({ title: "Authentication Error", description: "Please sign in again to join a room.", variant: "destructive" })
         return
       }
 
       const { error } = await supabase
         .from('game_players')
-        .insert([
-          {
-            room_id: roomId,
-            user_id: userData.user.id,
-          }
-        ])
+        .insert([{ room_id: roomId, user_id: user.id }])
 
       if (error) {
-        console.error('Error joining room:', error.message, error.details)
-        if (error.code === '23505') {
-          // User already in room, just join
+        console.error('Error joining room:', error)
+        if (error.code === '23505') { // Unique constraint violation
+          // User is already in the room, let them join
           setActiveRoom(roomId)
         } else {
-          alert(`Failed to join room: ${error.message}`)
+          toast({ title: "Error", description: `Failed to join room: ${error.message}`, variant: "destructive" })
         }
         return
       }
@@ -172,7 +147,7 @@ export default function GameLobby({ user }: { user: User }) {
       setActiveRoom(roomId)
     } catch (err) {
       console.error('Unexpected error:', err)
-      alert('An unexpected error occurred. Please try again.')
+      toast({ title: 'Error', description: 'An unexpected error occurred.', variant: 'destructive' })
     }
   }
 
@@ -218,7 +193,7 @@ export default function GameLobby({ user }: { user: User }) {
                 onKeyPress={(e) => e.key === 'Enter' && createRoom()}
               />
               <Button onClick={createRoom} disabled={loading || !newRoomName.trim()}>
-                Create
+                {loading ? 'Creating...' : 'Create'}
               </Button>
             </div>
           </CardContent>
@@ -262,3 +237,4 @@ export default function GameLobby({ user }: { user: User }) {
     </div>
   )
 }
+
